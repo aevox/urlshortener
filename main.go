@@ -1,11 +1,12 @@
 package main
 
 import (
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -14,10 +15,15 @@ import (
 	_ "github.com/lib/pq"
 )
 
+type RequestBody struct {
+	URL string `json:"url"`
+}
+
 // URLStore interface for URL storage operations
 type URLStore interface {
 	InsertURL(slug string, originalURL string) error
 	GetOriginalURL(slug string) (string, error)
+	FindSlugByURL(originalURL string) (string, error)
 }
 
 // PostgresURLStore implements URLStore with PostgreSQL
@@ -36,8 +42,73 @@ func (store *PostgresURLStore) GetOriginalURL(slug string) (string, error) {
 	return originalURL, err
 }
 
-type RequestBody struct {
-	URL string `json:"url"`
+func (store *PostgresURLStore) FindSlugByURL(originalURL string) (string, error) {
+	var slug string
+	err := store.DB.QueryRow("SELECT slug FROM urls WHERE original_url = $1", originalURL).Scan(&slug)
+	if err != nil {
+		return "", err // Will return sql.ErrNoRows if not found
+	}
+	return slug, nil
+}
+
+func generateSlug(text string) string {
+	hash := md5.Sum([]byte(text))
+	md5Hex := hex.EncodeToString(hash[:])
+	return md5Hex[:6] // Return only the first 6 characters
+}
+
+func shortenURL(store URLStore, w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		log.Printf("Method is not supported")
+		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var requestBody RequestBody
+	err := json.NewDecoder(r.Body).Decode(&requestBody)
+	if err != nil || requestBody.URL == "" {
+		log.Printf("Invalid request body: %v", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Check if the URL is already stored and get the associated slug
+	existingSlug, err := store.FindSlugByURL(requestBody.URL)
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("Error querying URL: %v", err)
+		http.Error(w, "Error querying URL", http.StatusInternalServerError)
+		return
+	}
+
+	var slug string
+	if err == sql.ErrNoRows {
+		// URL not found, generate a new slug and insert it
+		slug = generateSlug(requestBody.URL)
+		err = store.InsertURL(slug, requestBody.URL)
+		if err != nil {
+			log.Printf("Error inserting URL: %v", err)
+			http.Error(w, "Error storing shortened URL", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// URL found, use the existing slug
+		slug = existingSlug
+	}
+
+	shortenedURL := "http://localhost:8080/" + slug
+	fmt.Printf("Shortened url %s to %s\n", requestBody.URL, shortenedURL)
+	json.NewEncoder(w).Encode(map[string]string{"shortened_url": shortenedURL})
+}
+
+func redirect(store URLStore, w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/")
+	originalURL, err := store.GetOriginalURL(slug)
+	if err != nil {
+		http.Error(w, "URL not found", http.StatusNotFound)
+		return
+	}
+	fmt.Printf("Redirected url http://localhost:8080/%s to %s\n", slug, originalURL)
+	http.Redirect(w, r, originalURL, http.StatusTemporaryRedirect)
 }
 
 func initDB() (*sql.DB, error) {
@@ -51,87 +122,39 @@ func initDB() (*sql.DB, error) {
 
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s", host, port, user, password, dbname, sslmode)
 
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, fmt.Errorf("Error opening database: %v\n", err)
+	var db *sql.DB
+	var err error
+
+	for i := 0; i < 3; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err != nil {
+			log.Printf("Error opening database: %v. Retrying in 3 seconds...\n", err)
+		} else {
+			err = db.Ping()
+			if err == nil {
+				log.Println("Successfully connected to the database.")
+				return db, nil // Return the successful database connection
+			}
+			log.Printf("Error connecting to the database: %v. Retrying in 3 seconds...\n", err)
+		}
+
+		// Wait for 3 seconds before the next retry
+		time.Sleep(3 * time.Second)
 	}
-
-	err = db.Ping()
-	if err != nil {
-		return nil, fmt.Errorf("Error connecting to the database: %v\n", err)
-	}
-
-	createTableSQL := `CREATE TABLE IF NOT EXISTS urls (
-        slug CHAR(6) PRIMARY KEY,
-        original_url TEXT NOT NULL
-    );`
-	_, err = db.Exec(createTableSQL)
-	if err != nil {
-		return nil, fmt.Errorf("Error creating urls table: %v\n", err)
-	}
-	fmt.Println("Connected to the database and ensured the 'urls' table exists.")
-
-	return db, nil
-}
-
-func generateSlug(n int) string {
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-	s := make([]rune, n)
-	for i := range s {
-		s[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(s)
-}
-
-func shortenURL(store URLStore, w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var requestBody RequestBody
-	err := json.NewDecoder(r.Body).Decode(&requestBody)
-	if err != nil || requestBody.URL == "" {
-		log.Printf("%v", err)
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	slug := generateSlug(6)
-	err = store.InsertURL(slug, requestBody.URL)
-	if err != nil {
-		log.Printf("Error inserting URL: %v", err)
-		http.Error(w, "Error storing shortened URL", http.StatusInternalServerError)
-		return
-	}
-
-	shortenedURL := "http://localhost:8080/" + slug
-	json.NewEncoder(w).Encode(map[string]string{"shortened_url": shortenedURL})
-}
-
-func redirect(store URLStore, w http.ResponseWriter, r *http.Request) {
-	slug := strings.TrimPrefix(r.URL.Path, "/")
-	originalURL, err := store.GetOriginalURL(slug)
-	if err != nil {
-		http.Error(w, "URL not found", http.StatusNotFound)
-		return
-	}
-
-	http.Redirect(w, r, originalURL, http.StatusTemporaryRedirect)
+	return nil, fmt.Errorf("Error initializing the DB: ", err)
 }
 
 func main() {
 	// Initialize database
 	db, err := initDB()
 	if err != nil {
-		log.Fatal("Error opening database:", err)
+		log.Fatal("Error opening database: ", err)
 	}
 	defer db.Close()
 
 	// Create the URLStore implementation
 	store := &PostgresURLStore{DB: db}
 
-	rand.Seed(time.Now().UnixNano())
 	http.HandleFunc("/shorten", func(w http.ResponseWriter, r *http.Request) {
 		shortenURL(store, w, r)
 	})

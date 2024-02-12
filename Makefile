@@ -38,12 +38,12 @@ clean:
 docker:
 	$(DOCKER_BUILD) -t $(DOCKER_IMAGE_NAME):$(DOCKER_TAG) .
 
-# Build the Docker image
-.PHONY: nix-build
-nix-build:
+# Build the Go binary with nix
+.PHONY: nix
+nix:
 	nix-build default.nix
 
-# Build the Docker image
+# Build the Docker image with nix
 .PHONY: nix-docker
 nix-docker:
 	$(DOCKER_BUILD) -f NixDockerfile -t nix$(DOCKER_IMAGE_NAME):$(DOCKER_TAG) .
